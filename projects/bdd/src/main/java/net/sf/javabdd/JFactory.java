@@ -4030,10 +4030,6 @@ public class JFactory extends BDDFactory implements Serializable {
     return ret;
   }
 
-  private int bdd_getnodenum() {
-    return bddnodesize - bddfreenum.get();
-  }
-
   @Override
   public int getNodeTableSize() {
     return bdd_getallocnum();
@@ -4041,11 +4037,6 @@ public class JFactory extends BDDFactory implements Serializable {
 
   private int bdd_getallocnum() {
     return bddnodesize;
-  }
-
-  @Override
-  public int getNodeNum() {
-    return bdd_getnodenum();
   }
 
   @Override
