@@ -13,6 +13,7 @@ import net.sf.javabdd.BDDFactory;
 import net.sf.javabdd.BDDPairing;
 import net.sf.javabdd.BDDVarPair;
 import net.sf.javabdd.JFactory;
+import org.batfish.datamodel.IpProtocol;
 
 /** Various utility methods for working with {@link BDD}s. */
 public class BDDUtils {
@@ -66,5 +67,60 @@ public class BDDUtils {
                     i -> Stream.of(new BDDVarPair(bv1[i], bv2[i]), new BDDVarPair(bv2[i], bv1[i])))
                 .flatMap(Function.identity())
                 .collect(ImmutableSet.toImmutableSet()));
+  }
+
+  /**
+   * Checks that the given BDD obeys packet invariants about which fields can be tested
+   * independently vs must be tested together (e.g., ICMP Code should only be tested if this is an
+   * ICMP packet).
+   */
+  public static boolean aclHasPacketInvariants(BDDPacket pkt, BDD aclBdd) {
+    // TCP Flags should only be set for TCP packets
+    BDD tcp = pkt.getIpProtocol().value(IpProtocol.TCP);
+    BDD notTcp = tcp.not().andEq(aclBdd);
+    boolean tcpOk =
+        !notTcp.testsVars(pkt.getTcpAck())
+            && !notTcp.testsVars(pkt.getTcpCwr())
+            && !notTcp.testsVars(pkt.getTcpEce())
+            && !notTcp.testsVars(pkt.getTcpFin())
+            && !notTcp.testsVars(pkt.getTcpPsh())
+            && !notTcp.testsVars(pkt.getTcpRst())
+            && !notTcp.testsVars(pkt.getTcpSyn())
+            && !notTcp.testsVars(pkt.getTcpUrg());
+    notTcp.free();
+    tcp.free();
+    if (!tcpOk) {
+      return false;
+    }
+
+    // ICMP type/code should only be set for ICMP packets
+    BDD icmp = pkt.getIpProtocol().value(IpProtocol.ICMP);
+    BDD notIcmp = icmp.not().andEq(aclBdd);
+    boolean icmpOk =
+        !notIcmp.testsVars(pkt.getIcmpType().getBDDInteger().getVars())
+            && !notIcmp.testsVars(pkt.getIcmpCode().getBDDInteger().getVars());
+    notIcmp.free();
+    icmp.free();
+    if (!icmpOk) {
+      return false;
+    }
+
+    // Ports should only be set for protocols with ports
+    BDD[] portProtocols =
+        IpProtocol.IP_PROTOCOLS_WITH_PORTS.stream()
+            .map(pkt.getIpProtocol()::value)
+            .toArray(BDD[]::new);
+    BDD ports = pkt.getFactory().orAllAndFree(portProtocols);
+    BDD notPorts = ports.not().andEq(aclBdd);
+    BDD srcPort = pkt.getSrcPort().getVars();
+    BDD dstPort = pkt.getDstPort().getVars();
+    boolean portsOk = !notPorts.testsVars(srcPort) && !notPorts.testsVars(dstPort);
+    notPorts.free();
+    ports.free();
+    if (!portsOk) {
+      return false;
+    }
+
+    return true;
   }
 }
