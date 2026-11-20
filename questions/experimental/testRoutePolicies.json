@@ -40,7 +40,7 @@
                 "displayName": "Policies"
             },
             "inputRoutes": {
-                "description": "The BGP route announcements to test the policy on",
+                "description": "The BGP route announcements to test the policy on. A route with protocol static is tested as a static route (its network, next hop, administrative distance, metric and tag), as when a policy redistributes static routes",
                 "type": "bgpRoutes",
                 "displayName": "Input Routes"
             },

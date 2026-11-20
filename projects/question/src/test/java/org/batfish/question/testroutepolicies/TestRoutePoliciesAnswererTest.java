@@ -23,6 +23,7 @@ import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -33,6 +34,7 @@ import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.ImmutableSortedSet;
 import java.util.List;
 import org.batfish.common.plugin.IBatfish;
+import org.batfish.datamodel.AbstractRoute;
 import org.batfish.datamodel.AsPath;
 import org.batfish.datamodel.Bgpv4Route;
 import org.batfish.datamodel.Configuration;
@@ -76,6 +78,7 @@ import org.batfish.datamodel.routing_policy.statement.If;
 import org.batfish.datamodel.routing_policy.statement.SetAdministrativeCost;
 import org.batfish.datamodel.routing_policy.statement.SetColor;
 import org.batfish.datamodel.routing_policy.statement.SetColor2;
+import org.batfish.datamodel.routing_policy.statement.SetLocalPreference;
 import org.batfish.datamodel.routing_policy.statement.SetMetric;
 import org.batfish.datamodel.routing_policy.statement.SetNextHop;
 import org.batfish.datamodel.routing_policy.statement.SetTag;
@@ -966,5 +969,119 @@ class TestRoutePoliciesAnswererTest {
     assertEquals(result.getInputRoute(), inputRoute);
     assertEquals(result.getAction(), DENY);
     assertThat(result.getOutputRoute(), nullValue());
+  }
+
+  /** Accepts static routes with tag 100 and sets local preference 200; rejects everything else. */
+  private RoutingPolicy staticTag100Policy() {
+    return _policyBuilder
+        .setStatements(
+            ImmutableList.of(
+                new If(
+                    new Conjunction(
+                        ImmutableList.of(
+                            new MatchProtocol(RoutingProtocol.STATIC),
+                            new MatchTag(IntComparator.EQ, new LiteralLong(100)))),
+                    ImmutableList.of(
+                        new SetLocalPreference(new LiteralLong(200)),
+                        new StaticStatement(Statements.ExitAccept))),
+                new StaticStatement(Statements.ExitReject)))
+        .build();
+  }
+
+  /** A question input route for 10.0.0.0/24 with the given protocol and tag 100. */
+  private static BgpRoute inputRoute(RoutingProtocol protocol) {
+    return BgpRoute.builder()
+        .setNetwork(Prefix.parse("10.0.0.0/24"))
+        .setOriginatorIp(Ip.ZERO)
+        .setOriginType(OriginType.INCOMPLETE)
+        .setNextHopIp(Ip.parse("1.1.1.1"))
+        .setTag(100)
+        .setProtocol(protocol)
+        .build();
+  }
+
+  private TableAnswerElement answerOut(RoutingPolicy policy, BgpRoute route) {
+    TestRoutePoliciesQuestion question =
+        new TestRoutePoliciesQuestion(
+            Direction.OUT, ImmutableList.of(route), HOSTNAME, policy.getName(), null);
+    return new TestRoutePoliciesAnswerer(question, _batfish).answer(_batfish.getSnapshot());
+  }
+
+  @Test
+  void testStaticInputRouteIsTestedAsAStaticRoute() {
+    RoutingPolicy policy = staticTag100Policy();
+    BgpRoute input = inputRoute(RoutingProtocol.STATIC);
+
+    TableAnswerElement answer = answerOut(policy, input);
+
+    assertThat(
+        answer.getRows().getData(),
+        Matchers.contains(
+            allOf(
+                hasColumn(COL_INPUT_ROUTE, equalTo(input), BGP_ROUTE),
+                hasColumn(COL_ACTION, equalTo(PERMIT.toString()), Schema.STRING),
+                hasColumn(COL_DIFF, nullValue(), BGP_ROUTE_DIFFS))));
+    BgpRoute output = (BgpRoute) answer.getRowsList().get(0).get(COL_OUTPUT_ROUTE, BGP_ROUTE);
+    assertEquals(200, output.getLocalPreference());
+    assertEquals(RoutingProtocol.BGP, output.getProtocol());
+    assertEquals(RoutingProtocol.STATIC, output.getSrcProtocol());
+    assertEquals(100, output.getTag());
+  }
+
+  @Test
+  void testBgpInputRouteDoesNotMatchAStaticOnlyPolicy() {
+    TableAnswerElement answer = answerOut(staticTag100Policy(), inputRoute(RoutingProtocol.BGP));
+
+    assertThat(
+        answer.getRows().getData(),
+        Matchers.contains(hasColumn(COL_ACTION, equalTo(DENY.toString()), Schema.STRING)));
+  }
+
+  @Test
+  void testToDataplaneRoute() {
+    AbstractRoute staticRoute =
+        TestRoutePoliciesAnswerer.toDataplaneRoute(inputRoute(RoutingProtocol.STATIC));
+    assertEquals(
+        StaticRoute.builder()
+            .setNetwork(Prefix.parse("10.0.0.0/24"))
+            .setNextHopIp(Ip.parse("1.1.1.1"))
+            .setAdministrativeCost(BgpRoute.DEFAULT_AD)
+            .setMetric(0)
+            .setTag(100)
+            .build(),
+        staticRoute);
+    assertThat(
+        TestRoutePoliciesAnswerer.toDataplaneRoute(inputRoute(RoutingProtocol.BGP)),
+        instanceOf(Bgpv4Route.class));
+  }
+
+  @Test
+  void testToQuestionRouteRoundTripsAStaticInput() {
+    BgpRoute input = inputRoute(RoutingProtocol.STATIC);
+    assertEquals(
+        input,
+        TestRoutePoliciesAnswerer.toQuestionRoute(
+            TestRoutePoliciesAnswerer.toDataplaneRoute(input)));
+  }
+
+  @Test
+  void testStaticInputDifferential() {
+    RoutingPolicy policy = staticTag100Policy();
+    _deltaPolicyBuilder
+        .setStatements(ImmutableList.of(new StaticStatement(Statements.ExitReject)))
+        .build();
+    BgpRoute input = inputRoute(RoutingProtocol.STATIC);
+    TestRoutePoliciesQuestion question =
+        new TestRoutePoliciesQuestion(
+            Direction.OUT, ImmutableList.of(input), HOSTNAME, policy.getName(), null);
+
+    TableAnswerElement answer =
+        (TableAnswerElement)
+            new TestRoutePoliciesAnswerer(question, _batfish)
+                .answerDiff(_batfish.getSnapshot(), _batfish.getReferenceSnapshot());
+
+    assertThat(
+        answer.getRows().getData(),
+        Matchers.contains(hasColumn(COL_INPUT_ROUTE, equalTo(input), BGP_ROUTE)));
   }
 }

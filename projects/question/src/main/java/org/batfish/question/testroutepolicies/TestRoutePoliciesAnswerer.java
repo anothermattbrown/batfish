@@ -38,6 +38,7 @@ import org.batfish.datamodel.Bgpv4Route;
 import org.batfish.datamodel.Ip;
 import org.batfish.datamodel.LineAction;
 import org.batfish.datamodel.OriginMechanism;
+import org.batfish.datamodel.OriginType;
 import org.batfish.datamodel.ReceivedFromSelf;
 import org.batfish.datamodel.RoutingProtocol;
 import org.batfish.datamodel.StaticRoute;
@@ -75,7 +76,10 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
   public static final String COL_TRACE = "Trace";
 
   private final @Nonnull Direction _direction;
-  private final @Nonnull List<Bgpv4Route> _inputRoutes;
+
+  /** Each input route as the simulation sees it: a {@link Bgpv4Route} or a {@link StaticRoute}. */
+  private final @Nonnull List<AbstractRoute> _inputRoutes;
+
   private final @Nonnull NodeSpecifier _nodeSpecifier;
   private final @Nonnull RoutingPolicySpecifier _policySpecifier;
 
@@ -86,7 +90,7 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
     _direction = question.getDirection();
     _inputRoutes =
         question.getInputRoutes().stream()
-            .map(TestRoutePoliciesAnswerer::toDataplaneBgpRoute)
+            .map(TestRoutePoliciesAnswerer::toDataplaneRoute)
             .collect(Collectors.toList());
     _nodeSpecifier =
         SpecifierFactories.getNodeSpecifierOrDefault(
@@ -115,12 +119,19 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
         .collect(ImmutableSortedSet.toImmutableSortedSet(Ordering.natural()));
   }
 
-  public Result<Bgpv4Route, Bgpv4Route> getResult(
-      SpecifierContext context, Result.Key<Bgpv4Route> key, Direction direction) {
+  public Result<AbstractRoute, Bgpv4Route> getResult(
+      SpecifierContext context, Result.Key<AbstractRoute> key, Direction direction) {
     RoutingPolicyId policyId = key.getPolicyId();
     RoutingPolicy policy =
         context.getConfigs().get(policyId.getNode()).getRoutingPolicies().get(policyId.getPolicy());
-    return simulatePolicyWithBgpRoute(policy, key.getInputRoute(), direction);
+    Result<? extends AbstractRoute, Bgpv4Route> result =
+        simulatePolicy(policy, key.getInputRoute(), _bgpSessionProperties, direction, null, null);
+    return new Result<>(
+        result.getPolicyId(),
+        key.getInputRoute(),
+        result.getAction(),
+        result.getOutputRoute(),
+        result.getTrace());
   }
 
   /**
@@ -153,20 +164,6 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
       default:
         throw new IllegalArgumentException("Unexpected route protocol " + inputRoute.getProtocol());
     }
-  }
-
-  /**
-   * Produce the results of simulating the given route policy on the given BGP route.
-   *
-   * @param policy the route policy to simulate
-   * @param inputRoute the input route for the policy
-   * @param direction whether the policy is used on import or export (IN or OUT)
-   * @return the results of the simulation
-   */
-  private Result<Bgpv4Route, Bgpv4Route> simulatePolicyWithBgpRoute(
-      RoutingPolicy policy, Bgpv4Route inputRoute, Direction direction) {
-    return simulatePolicyWithBgpRoute(
-        policy, inputRoute, _bgpSessionProperties, direction, null, null);
   }
 
   /**
@@ -285,7 +282,7 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
     SpecifierContext context = _batfish.specifierContext(snapshot);
 
     // Materialized for efficient parallelism.
-    List<Result.Key<Bgpv4Route>> tasks =
+    List<Result.Key<AbstractRoute>> tasks =
         resolvePolicies(context).stream()
             .flatMap(rpid -> _inputRoutes.stream().map(r -> new Key<>(rpid, r)))
             .collect(ImmutableList.toImmutableList());
@@ -300,6 +297,37 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
     TableAnswerElement answerElement = new TableAnswerElement(metadata());
     answerElement.postProcessAnswer(_question, rows);
     return answerElement;
+  }
+
+  /**
+   * Convert a question input route to the route the simulation runs on: a {@link StaticRoute} if
+   * its protocol is {@code static}, otherwise a {@link Bgpv4Route}.
+   */
+  @VisibleForTesting
+  static @Nonnull AbstractRoute toDataplaneRoute(org.batfish.datamodel.questions.BgpRoute route) {
+    return route.getProtocol() == RoutingProtocol.STATIC
+        ? toDataplaneStaticRoute(route)
+        : toDataplaneBgpRoute(route);
+  }
+
+  /**
+   * A static input route keeps the network, next hop, administrative distance, metric and tag of
+   * the question's route; its BGP attributes are ignored. This lets a policy that redistributes
+   * static routes (for example an export policy matching {@code protocol static}) be tested.
+   */
+  private static @Nonnull StaticRoute toDataplaneStaticRoute(
+      org.batfish.datamodel.questions.BgpRoute route) {
+    checkArgument(
+        route.getNextHop() instanceof NextHopConcrete,
+        "Unexpected next-hop: " + route.getNextHop());
+    return StaticRoute.builder()
+        .setNetwork(route.getNetwork())
+        .setNextHop(((NextHopConcrete) route.getNextHop()).getNextHop())
+        // As for BGP inputs, the administrative distance is not matched by policies.
+        .setAdministrativeCost(firstNonNull(route.getAdminDist(), BgpRoute.DEFAULT_AD))
+        .setMetric(route.getMetric())
+        .setTag(route.getTag())
+        .build();
   }
 
   private static @Nullable Bgpv4Route toDataplaneBgpRoute(
@@ -347,6 +375,30 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
    * @param dataplaneBgpRoute the original route
    * @return a version of the route suitable for output from this analysis
    */
+  /**
+   * Convert a simulated input route back to the question's route format. A {@link StaticRoute}
+   * becomes a route with protocol {@code static}, its network, next hop, administrative distance,
+   * metric and tag, originator IP 0.0.0.0 and origin type incomplete.
+   */
+  public static @Nonnull org.batfish.datamodel.questions.BgpRoute toQuestionRoute(
+      AbstractRoute route) {
+    if (route instanceof Bgpv4Route bgpRoute) {
+      return toQuestionBgpRoute(bgpRoute);
+    }
+    checkArgument(route instanceof StaticRoute, "Unexpected input route: %s", route);
+    StaticRoute staticRoute = (StaticRoute) route;
+    return org.batfish.datamodel.questions.BgpRoute.builder()
+        .setNetwork(staticRoute.getNetwork())
+        .setProtocol(RoutingProtocol.STATIC)
+        .setNextHopConcrete(staticRoute.getNextHop())
+        .setAdminDist(staticRoute.getAdministrativeCost())
+        .setMetric(staticRoute.getMetric())
+        .setTag(staticRoute.getTag())
+        .setOriginatorIp(Ip.ZERO)
+        .setOriginType(OriginType.INCOMPLETE)
+        .build();
+  }
+
   public static @Nullable org.batfish.datamodel.questions.BgpRoute toQuestionBgpRoute(
       @Nullable Bgpv4Route dataplaneBgpRoute) {
     if (dataplaneBgpRoute == null) {
@@ -392,7 +444,7 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
         Sets.intersection(resolvePolicies(context), resolvePolicies(referenceCtx));
 
     // Materialized for efficient parallelism.
-    List<Result.Key<Bgpv4Route>> tasks =
+    List<Result.Key<AbstractRoute>> tasks =
         policiesToTest.stream()
             .flatMap(rpid -> _inputRoutes.stream().map(r -> new Key<>(rpid, r)))
             .collect(ImmutableList.toImmutableList());
@@ -400,8 +452,9 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
     List<Row> rows =
         tasks.parallelStream()
             .map(key -> {
-              Result<Bgpv4Route, Bgpv4Route> snapshotResult = getResult(context, key, _direction);
-              Result<Bgpv4Route, Bgpv4Route> referenceResult =
+              Result<AbstractRoute, Bgpv4Route> snapshotResult =
+                  getResult(context, key, _direction);
+              Result<AbstractRoute, Bgpv4Route> referenceResult =
                   getResult(referenceCtx, key, _direction);
               return toDiffRow(snapshotResult, referenceResult);
             })
@@ -551,10 +604,11 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
    * @param result the original simulation result
    * @return a version of the result suitable for output from this analysis
    */
-  public static Result<BgpRoute, BgpRoute> toQuestionResult(Result<Bgpv4Route, Bgpv4Route> result) {
+  public static Result<BgpRoute, BgpRoute> toQuestionResult(
+      Result<? extends AbstractRoute, Bgpv4Route> result) {
     return new Result<>(
         result.getPolicyId(),
-        toQuestionBgpRoute(result.getInputRoute()),
+        toQuestionRoute(result.getInputRoute()),
         result.getAction(),
         toQuestionBgpRoute(result.getOutputRoute()),
         result.getTrace());
@@ -572,7 +626,13 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
         .put(COL_INPUT_ROUTE, inputRoute)
         .put(COL_ACTION, action)
         .put(COL_OUTPUT_ROUTE, permit ? outputRoute : null)
-        .put(COL_DIFF, permit ? routeDiffs(inputRoute, outputRoute) : null)
+        // A static input becomes a BGP route (protocol, source protocol and origin mechanism all
+        // change), which routeDiffs does not compare; the output route is reported in full instead.
+        .put(
+            COL_DIFF,
+            permit && inputRoute.getProtocol() != RoutingProtocol.STATIC
+                ? routeDiffs(inputRoute, outputRoute)
+                : null)
         .put(COL_TRACE, result.getTrace())
         .build();
   }
@@ -586,8 +646,8 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
    */
   @VisibleForTesting
   static @Nullable Row toDiffRow(
-      Result<Bgpv4Route, Bgpv4Route> snapshotResult,
-      Result<Bgpv4Route, Bgpv4Route> referenceResult) {
+      Result<? extends AbstractRoute, Bgpv4Route> snapshotResult,
+      Result<? extends AbstractRoute, Bgpv4Route> referenceResult) {
     assert snapshotResult.getKey().equals(referenceResult.getKey());
 
     if (snapshotResult.equals(referenceResult)) {
@@ -609,11 +669,11 @@ public final class TestRoutePoliciesAnswerer extends Answerer {
     BgpRouteDiffs routeDiffs = routeDiffs(referenceOutputRoute, snapshotOutputRoute);
 
     RoutingPolicyId policyId = snapshotResult.getPolicyId();
-    Bgpv4Route inputRoute = snapshotResult.getInputRoute();
+    AbstractRoute inputRoute = snapshotResult.getInputRoute();
     return Row.builder()
         .put(COL_NODE, new Node(policyId.getNode()))
         .put(COL_POLICY_NAME, policyId.getPolicy())
-        .put(COL_INPUT_ROUTE, toQuestionBgpRoute(inputRoute))
+        .put(COL_INPUT_ROUTE, toQuestionRoute(inputRoute))
         .put(baseColumnName(COL_ACTION), snapshotResult.getAction())
         .put(deltaColumnName(COL_ACTION), referenceResult.getAction())
         .put(baseColumnName(COL_OUTPUT_ROUTE), snapshotOutputRoute)
